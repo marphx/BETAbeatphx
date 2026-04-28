@@ -877,6 +877,40 @@ select,input[type=text]{
   }
 }
 
+
+/* --- Bank visibility + loop timing final polish --- */
+.deckLook{
+  max-height:100% !important;
+  position:relative;
+}
+.deckLook::after{
+  content:"";
+  position:sticky;
+  display:block;
+  left:0;
+  right:0;
+  bottom:-1px;
+  height:22px;
+  pointer-events:none;
+  background:linear-gradient(180deg, transparent, rgba(20,10,34,.9));
+}
+.bankHead{
+  flex-wrap:wrap;
+}
+@media (max-width:980px){
+  .bankCol{
+    min-height:320px !important;
+    height:320px !important;
+  }
+  .deckSlot{
+    padding-bottom:56px !important;
+  }
+}
+@media (orientation:landscape) and (max-height:700px){
+  .bankHead span{display:none}
+  .deckSlot{padding-bottom:40px !important}
+}
+
 </style>
 </head>
 <body>
@@ -934,6 +968,7 @@ select,input[type=text]{
               <div class="bankPanel">
                 <div class="bankHead">
                   <h3 style="margin:0">Sound Banks</h3>
+                  <span style="font-size:.58rem;color:#d8cbb3">swipe / arrows</span>
                   <button class="miniBtn" id="bankPrevBtn">◀</button>
                   <button class="miniBtn" id="bankNextBtn">▶</button>
                   <button class="miniBtn" id="bankCollapseBtn">Deck</button>
@@ -1103,6 +1138,9 @@ const state = {
   playbackRaf: null,
   lastLoopPos: 0,
   playbackJustStarted: false,
+  scheduledKeys: new Set(),
+  lastPruneCycle: -999,
+  nextEventId: 1,
   visualHits: [],
   metronomeEnabled: false,
   countInEnabled: true,
@@ -1474,7 +1512,7 @@ function addLoopEvent(padIndex, sound, settings, when){
     pos = Math.max(0, Math.min(pos, 120));
   }
   const createdCycle = (state.isPlaying && state.loopLength > 0) ? getCycleAt(when) : -1;
-  state.loopEvents.push({time:pos, pad:padIndex, sound:sound, settings:settings, createdCycle:createdCycle});
+  state.loopEvents.push({id:state.nextEventId++, time:pos, pad:padIndex, sound:sound, settings:settings, createdCycle:createdCycle});
   state.redoStack = [];
 }
 
@@ -1499,7 +1537,6 @@ function tapPad(padIndex, scheduledTime, skipRecord, forcedSound, forcedSettings
       state.isPlaying = true;
       state.nextCycleStart = state.loopStartTime + state.loopLength;
       state.nextCycleNumber = 1;
-      startPlaybackEngine(false);
       startMetronome();
       $('playBtn').classList.add('active');
       $('recBtn').classList.add('active');
@@ -1516,7 +1553,11 @@ function tapPad(padIndex, scheduledTime, skipRecord, forcedSound, forcedSettings
   }
 
   if(state.isRecording && !state.waitingForFirstHit){
+    const wasFirstFixedHit = state.fixedLoop && state.isPlaying && state.loopEvents.length === 0;
     addLoopEvent(padIndex, sound, settings, time);
+    if(wasFirstFixedHit){
+      startPlaybackEngine(false);
+    }
   }
 }
 
@@ -1569,51 +1610,73 @@ function getCycleAt(t){
   return Math.floor((t - state.loopStartTime) / state.loopLength);
 }
 
-function scheduleOneCycle(cycleStart){
-  if(!state.isPlaying || state.loopLength <= 0) return;
-  const t = now();
-  const cycle = getCycleAt(Math.max(t, cycleStart));
-  const events = state.loopEvents.slice().sort(function(a,b){ return a.time - b.time; });
-
-  for(let i=0;i<events.length;i++){
-    const ev = events[i];
-    if(typeof ev.createdCycle === 'number' && ev.createdCycle >= cycle) continue;
-
-    const playAt = cycleStart + ev.time;
-    if(playAt < t - 0.02) continue;
-
-    const delayMs = Math.max(0, (playAt - t) * 1000);
-    setTimeout(function(){
-      if(state.isPlaying){
-        tapPad(ev.pad, undefined, true, ev.sound, ev.settings);
-      }
-    }, delayMs);
-  }
+function pruneScheduledKeys(currentCycle){
+  if(currentCycle === state.lastPruneCycle) return;
+  state.lastPruneCycle = currentCycle;
+  const keep = new Set();
+  state.scheduledKeys.forEach(function(key){
+    const cycle = Number(key.split(':')[0]);
+    if(cycle >= currentCycle - 1) keep.add(key);
+  });
+  state.scheduledKeys = keep;
 }
 
-function scheduleNextCycles(){
+function schedulePlaybackAudio(ev, playAt){
+  // Audio is scheduled directly against the Web Audio clock, so the loop reset
+  // happens exactly at the boundary instead of waiting on a late setTimeout.
+  playPadSound(ev.sound, ev.settings, ev.pad, playAt);
+
+  // Visual feedback can be a normal timer because it does not affect timing.
+  const delay = Math.max(0, (playAt - now()) * 1000);
+  setTimeout(function(){
+    if(state.isPlaying){
+      flashPad(ev.pad);
+      pushVisual(ev.pad);
+    }
+  }, delay);
+}
+
+function schedulerTick(){
   if(!state.isPlaying || state.loopLength <= 0) return;
 
   const t = now();
-  while(state.nextCycleStart < t - 0.03){
-    state.nextCycleStart += state.loopLength;
-    state.nextCycleNumber += 1;
+  const horizon = t + 0.18;
+  const currentCycle = getCycleAt(t);
+  pruneScheduledKeys(currentCycle);
+
+  const startCycle = Math.max(0, currentCycle);
+  const endCycle = getCycleAt(horizon) + 1;
+  const events = state.loopEvents.slice();
+
+  for(let cycle=startCycle; cycle<=endCycle; cycle++){
+    const cycleStart = state.loopStartTime + cycle * state.loopLength;
+
+    for(let i=0;i<events.length;i++){
+      const ev = events[i];
+      if(typeof ev.id === 'undefined') ev.id = i + 1;
+      if(typeof ev.createdCycle === 'number' && ev.createdCycle >= cycle) continue;
+
+      const playAt = cycleStart + ev.time;
+      if(playAt < t + 0.006 || playAt > horizon) continue;
+
+      const key = cycle + ':' + ev.id;
+      if(state.scheduledKeys.has(key)) continue;
+      state.scheduledKeys.add(key);
+
+      schedulePlaybackAudio(ev, playAt);
+    }
   }
-
-  scheduleOneCycle(state.nextCycleStart);
-
-  state.nextCycleStart += state.loopLength;
-  state.nextCycleNumber += 1;
-
-  const waitMs = Math.max(40, (state.nextCycleStart - now() - 0.12) * 1000);
-  state.schedulerTimer = setTimeout(scheduleNextCycles, waitMs);
 }
 
 function startPlaybackEngine(triggerZero){
   stopPlaybackEngine();
-  state.nextCycleStart = triggerZero ? state.loopStartTime : state.loopStartTime + state.loopLength;
-  state.nextCycleNumber = triggerZero ? 0 : 1;
-  scheduleNextCycles();
+  state.scheduledKeys = new Set();
+  state.lastPruneCycle = -999;
+
+  // If triggerZero is true, the first repeat is scheduled immediately from the
+  // top of the loop. Otherwise, new recording waits for the next cycle.
+  schedulerTick();
+  state.schedulerTimer = setInterval(schedulerTick, 25);
 }
 
 function stopPlaybackEngine(){
@@ -1624,6 +1687,7 @@ function stopPlaybackEngine(){
   clearInterval(state.schedulerTimer);
   clearTimeout(state.schedulerTimer);
   state.schedulerTimer = null;
+  state.scheduledKeys = new Set();
 }
 
 function startScheduler(){
@@ -1671,7 +1735,10 @@ function toggleRecord(){
     state.loopStartTime = now();
     state.nextCycleStart = state.loopStartTime;
     state.nextCycleNumber = 0;
-    for(let i=0;i<state.loopEvents.length;i++){ state.loopEvents[i].createdCycle = -1; }
+    for(let i=0;i<state.loopEvents.length;i++){
+      if(typeof state.loopEvents[i].id === 'undefined') state.loopEvents[i].id = state.nextEventId++;
+      state.loopEvents[i].createdCycle = -1;
+    }
     $('playBtn').classList.add('active');
     $('recBtn').classList.remove('active');
     startPlaybackEngine(true);
@@ -1704,6 +1771,10 @@ function togglePlay(){
     if(state.loopLength <= 0) state.loopLength = state.fixedLoop ? loopSeconds() : clamp(state.loopEvents[state.loopEvents.length - 1].time + 0.4, 0.2, 30);
     state.nextCycleStart = state.loopStartTime;
     state.nextCycleNumber = 0;
+    for(let i=0;i<state.loopEvents.length;i++){
+      if(typeof state.loopEvents[i].id === 'undefined') state.loopEvents[i].id = state.nextEventId++;
+      if(typeof state.loopEvents[i].createdCycle === 'undefined') state.loopEvents[i].createdCycle = -1;
+    }
     $('playBtn').classList.add('active');
     $('recBtn').classList.remove('active');
     startPlaybackEngine(true);
