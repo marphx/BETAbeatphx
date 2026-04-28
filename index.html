@@ -748,6 +748,79 @@ select,input[type=text]{
   }
   #meterCanvas{width:58vw}
 }
+
+/* --- Stability / viewability patch --- */
+.frameInner{overflow:hidden}
+.main{
+  overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;
+}
+.deckLook{
+  overflow-y:auto !important;
+  -webkit-overflow-scrolling:touch;
+  touch-action:pan-y;
+  overscroll-behavior:contain;
+  scrollbar-width:thin;
+}
+.deckSlot{
+  padding-bottom:18px;
+}
+.bankCol,.bankPanel{
+  min-height:0;
+}
+.sideCol{
+  -webkit-overflow-scrolling:touch;
+  touch-action:pan-y;
+  overscroll-behavior:contain;
+  padding-bottom:10px;
+}
+.settingsDrawer .console{
+  -webkit-overflow-scrolling:touch;
+  touch-action:pan-y;
+  padding-bottom:24px;
+}
+@media (max-width:980px){
+  .shell{
+    grid-template-rows:50px minmax(0,1fr) 68px;
+  }
+  .main{
+    overflow-y:auto;
+    padding-bottom:16px;
+  }
+  .bankCol{
+    min-height:240px;
+    height:240px;
+  }
+  .sideCol{
+    max-height:none;
+    overflow:visible;
+  }
+  .bottomBar{
+    padding:6px 8px;
+  }
+  #meterCanvas{
+    width:54vw;
+    height:50px;
+  }
+  .status{
+    font-size:.64rem;
+    max-width:42vw;
+  }
+}
+@media (orientation:landscape) and (max-height:700px){
+  .bankCol{
+    height:auto;
+    min-height:0;
+  }
+  .deckLook{
+    max-height:100%;
+  }
+  .sideCol{
+    overflow-y:auto;
+    padding-bottom:8px;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -969,6 +1042,9 @@ const state = {
   nextCycleNumber: 0,
   meterRaf: null,
   progressRaf: null,
+  playbackRaf: null,
+  lastLoopPos: 0,
+  playbackJustStarted: false,
   visualHits: [],
   metronomeEnabled: false,
   countInEnabled: true,
@@ -1324,9 +1400,10 @@ function addLoopEvent(padIndex, sound, settings, when){
   if(state.fixedLoop && state.loopLength > 0){
     pos = ((pos % state.loopLength) + state.loopLength) % state.loopLength;
   } else {
-    pos = Math.max(0, pos);
+    pos = Math.max(0, Math.min(pos, 120));
   }
-  state.loopEvents.push({time:pos, pad:padIndex, sound:sound, settings:settings});
+  const createdCycle = (state.isPlaying && state.loopLength > 0) ? getCycleAt(when) : -1;
+  state.loopEvents.push({time:pos, pad:padIndex, sound:sound, settings:settings, createdCycle:createdCycle});
   state.redoStack = [];
 }
 
@@ -1351,7 +1428,7 @@ function tapPad(padIndex, scheduledTime, skipRecord, forcedSound, forcedSettings
       state.isPlaying = true;
       state.nextCycleStart = state.loopStartTime + state.loopLength;
       state.nextCycleNumber = 1;
-      startScheduler();
+      startPlaybackEngine(false);
       startMetronome();
       $('playBtn').classList.add('active');
       $('recBtn').classList.add('active');
@@ -1416,32 +1493,66 @@ function selectPad(i){
   $('samplePadText').textContent = 'Pad ' + (i + 1);
 }
 
-function scheduleCycle(cycleStart){
+function getCycleAt(t){
+  if(state.loopLength <= 0) return 0;
+  return Math.floor((t - state.loopStartTime) / state.loopLength);
+}
+
+function eventCrossed(evTime, prev, pos){
+  if(state.loopLength <= 0) return false;
+  if(prev < 0){
+    return evTime >= 0 && evTime <= pos;
+  }
+  if(pos >= prev){
+    return evTime > prev && evTime <= pos;
+  }
+  return evTime > prev || evTime <= pos;
+}
+
+function playbackTick(){
+  if(!state.isPlaying || state.loopLength <= 0){
+    state.playbackRaf = null;
+    return;
+  }
+
+  const t = now();
+  const pos = currentLoopPosition(t);
+  const prev = state.lastLoopPos;
+  const cycle = getCycleAt(t);
+
   const events = state.loopEvents.slice().sort(function(a,b){ return a.time - b.time; });
   for(let i=0;i<events.length;i++){
     const ev = events[i];
-    const playAt = cycleStart + ev.time;
-    if(playAt >= now() - 0.02){
-      tapPad(ev.pad, playAt, true, ev.sound, ev.settings);
-    }
+    if(!eventCrossed(ev.time, prev, pos)) continue;
+    if(typeof ev.createdCycle === 'number' && ev.createdCycle >= cycle) continue;
+    tapPad(ev.pad, undefined, true, ev.sound, ev.settings);
   }
+
+  state.lastLoopPos = pos;
+  state.playbackRaf = requestAnimationFrame(playbackTick);
 }
-function schedulerTick(){
-  if(!state.isPlaying || state.loopLength <= 0) return;
-  const t = now();
-  while(state.nextCycleStart <= t + state.lookahead){
-    scheduleCycle(state.nextCycleStart);
-    state.nextCycleStart += state.loopLength;
-    state.nextCycleNumber += 1;
+
+function startPlaybackEngine(triggerZero){
+  stopPlaybackEngine();
+  state.lastLoopPos = triggerZero ? -0.001 : currentLoopPosition(now());
+  state.playbackRaf = requestAnimationFrame(playbackTick);
+}
+
+function stopPlaybackEngine(){
+  if(state.playbackRaf){
+    cancelAnimationFrame(state.playbackRaf);
+    state.playbackRaf = null;
   }
-}
-function startScheduler(){
-  clearInterval(state.schedulerTimer);
-  state.schedulerTimer = setInterval(schedulerTick, 25);
-}
-function stopScheduler(){
   clearInterval(state.schedulerTimer);
   state.schedulerTimer = null;
+}
+
+function startScheduler(){
+  startPlaybackEngine(false);
+}
+
+function stopScheduler(){
+  stopPlaybackEngine();
 }
 
 function stopPlayback(){
@@ -1475,15 +1586,16 @@ function toggleRecord(){
   }
 
   if(!state.fixedLoop && state.isRecording && !state.isPlaying){
-    state.loopLength = clamp(now() - state.freeformStartTime, 0.2, 30);
+    state.loopLength = clamp(now() - state.freeformStartTime, 0.2, 120);
     state.isPlaying = true;
     state.isRecording = false;
     state.loopStartTime = now();
     state.nextCycleStart = state.loopStartTime;
     state.nextCycleNumber = 0;
+    for(let i=0;i<state.loopEvents.length;i++){ state.loopEvents[i].createdCycle = -1; }
     $('playBtn').classList.add('active');
     $('recBtn').classList.remove('active');
-    startScheduler();
+    startPlaybackEngine(true);
     startMetronome();
     setStatus('Freeform loop closed. Playing back.');
     return;
@@ -1515,7 +1627,7 @@ function togglePlay(){
     state.nextCycleNumber = 0;
     $('playBtn').classList.add('active');
     $('recBtn').classList.remove('active');
-    startScheduler();
+    startPlaybackEngine(true);
     startMetronome();
     setStatus('Playing loop.');
   };
@@ -1571,7 +1683,7 @@ function updateLoopUI(){
     elapsed = currentLoopPosition(now());
   } else if(state.isRecording && !state.fixedLoop && !state.waitingForFirstHit){
     elapsed = now() - state.freeformStartTime;
-    total = Math.min(Math.max(elapsed, 0), 30);
+    total = Math.min(Math.max(elapsed, 0), 120);
   } else if(state.waitingForFirstHit){
     elapsed = 0;
     total = state.fixedLoop ? loopSeconds() : 0;
@@ -1692,6 +1804,7 @@ function extendLoopBars(delta){
       const currentPos = currentLoopPosition(now());
       state.loopLength = newLen;
       state.loopStartTime = now() - currentPos;
+      state.lastLoopPos = currentPos;
       state.nextCycleStart = state.loopStartTime + (Math.floor((now() - state.loopStartTime) / state.loopLength) + 1) * state.loopLength;
     } else {
       state.loopLength = newLen;
