@@ -821,6 +821,62 @@ select,input[type=text]{
   }
 }
 
+
+/* --- Final scroll + performance patch --- */
+.bankCol{
+  min-height:0 !important;
+  overflow:hidden !important;
+}
+.bankPanel{
+  height:100% !important;
+  min-height:0 !important;
+  display:flex !important;
+  flex-direction:column !important;
+}
+.deckLook{
+  flex:1 1 auto !important;
+  min-height:0 !important;
+  height:auto !important;
+  overflow-y:auto !important;
+  overflow-x:hidden !important;
+  -webkit-overflow-scrolling:touch !important;
+  touch-action:pan-y !important;
+  overscroll-behavior:contain !important;
+}
+.deckSlot{
+  min-height:max-content !important;
+  padding-bottom:34px !important;
+}
+.bankBtn{
+  touch-action:pan-y !important;
+}
+@media (max-width:980px){
+  .main{
+    overflow-y:auto !important;
+    -webkit-overflow-scrolling:touch !important;
+    touch-action:pan-y !important;
+  }
+  .bankCol{
+    height:280px !important;
+    min-height:280px !important;
+  }
+  .deckLook{
+    max-height:none !important;
+  }
+}
+@media (orientation:landscape) and (max-height:700px){
+  .main{
+    overflow:hidden !important;
+  }
+  .bankCol{
+    height:100% !important;
+    min-height:0 !important;
+  }
+  .deckLook{
+    height:100% !important;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -878,6 +934,8 @@ select,input[type=text]{
               <div class="bankPanel">
                 <div class="bankHead">
                   <h3 style="margin:0">Sound Banks</h3>
+                  <button class="miniBtn" id="bankPrevBtn">◀</button>
+                  <button class="miniBtn" id="bankNextBtn">▶</button>
                   <button class="miniBtn" id="bankCollapseBtn">Deck</button>
                 </div>
                 <div class="deckLook" id="deckLook">
@@ -1141,6 +1199,15 @@ function initAudio(){
   const masterDelayGain = ctx.createGain();
   const convolver = ctx.createConvolver();
   const reverbGain = ctx.createGain();
+
+  // Shared pad FX buses. These prevent new delay/reverb networks from being
+  // created on every loop hit, which was the main source of lag.
+  const padDelay = ctx.createDelay(1.1);
+  const padDelayFeedback = ctx.createGain();
+  const padDelayGain = ctx.createGain();
+  const padConvolver = ctx.createConvolver();
+  const padReverbGain = ctx.createGain();
+
   const masterOut = ctx.createGain();
   const analyser = ctx.createAnalyser();
   const recorderDest = ctx.createMediaStreamDestination();
@@ -1152,8 +1219,16 @@ function initAudio(){
   masterDelayFeedback.gain.value = 0.28;
   masterDelayGain.gain.value = 0;
   reverbGain.gain.value = 0;
+
+  padDelay.delayTime.value = 0.18;
+  padDelayFeedback.gain.value = 0.26;
+  padDelayGain.gain.value = 1;
+  padReverbGain.gain.value = 1;
+
   masterOut.gain.value = .8;
-  convolver.buffer = createImpulse(ctx, 1.8, 2.2);
+  const sharedImpulse = createImpulse(ctx, 1.25, 2.8);
+  convolver.buffer = sharedImpulse;
+  padConvolver.buffer = sharedImpulse;
   analyser.fftSize = 2048;
 
   masterInput.connect(masterFilter);
@@ -1172,11 +1247,18 @@ function initAudio(){
   convolver.connect(reverbGain);
   reverbGain.connect(masterOut);
 
+  padDelay.connect(padDelayFeedback);
+  padDelayFeedback.connect(padDelay);
+  padDelay.connect(padDelayGain);
+  padDelayGain.connect(masterInput);
+  padConvolver.connect(padReverbGain);
+  padReverbGain.connect(masterInput);
+
   masterOut.connect(analyser);
   analyser.connect(ctx.destination);
   analyser.connect(recorderDest);
 
-  state.audio = {ctx, masterInput, masterFilter, masterDrive, masterDry, masterDelay, masterDelayFeedback, masterDelayGain, convolver, reverbGain, masterOut, analyser, recorderDest};
+  state.audio = {ctx, masterInput, masterFilter, masterDrive, masterDry, masterDelay, masterDelayFeedback, masterDelayGain, convolver, reverbGain, padDelay, padDelayFeedback, padDelayGain, padConvolver, padReverbGain, masterOut, analyser, recorderDest};
   applyMasterSettings();
 }
 function ensureAudio(){
@@ -1216,45 +1298,34 @@ function pushVisual(i){
 
 function routeNode(source, duration, settings, startAt){
   const ctx = state.audio.ctx;
+
   const filter = ctx.createBiquadFilter();
   filter.type = 'lowpass';
   filter.frequency.value = 220 + (settings.filter / 100) * 15780;
 
   const drive = ctx.createWaveShaper();
-  drive.curve = makeDriveCurve((settings.drive / 100) * 50);
+  drive.curve = makeDriveCurve((settings.drive / 100) * 36);
 
   const amp = ctx.createGain();
   amp.gain.setValueAtTime(0.001, startAt);
-  amp.gain.linearRampToValueAtTime(0.95, startAt + 0.01);
-  amp.gain.exponentialRampToValueAtTime(0.001, startAt + Math.max(0.08, duration));
+  amp.gain.linearRampToValueAtTime(0.9, startAt + 0.008);
+  amp.gain.exponentialRampToValueAtTime(0.001, startAt + Math.max(0.07, duration));
 
-  const d = ctx.createDelay(1.1);
-  d.delayTime.value = 0.18;
-  const df = ctx.createGain();
-  df.gain.value = (settings.delay / 100) * 0.28;
-  const dg = ctx.createGain();
-  dg.gain.value = (settings.delay / 100) * 0.32;
+  const delaySend = ctx.createGain();
+  delaySend.gain.value = (settings.delay / 100) * 0.34;
 
-  const rv = ctx.createConvolver();
-  rv.buffer = state.audio.convolver.buffer;
-  const rg = ctx.createGain();
-  rg.gain.value = (settings.reverb / 100) * 0.42;
+  const reverbSend = ctx.createGain();
+  reverbSend.gain.value = (settings.reverb / 100) * 0.38;
 
   source.connect(filter);
   filter.connect(drive);
   drive.connect(amp);
 
   amp.connect(state.audio.masterInput);
-
-  amp.connect(d);
-  d.connect(df);
-  df.connect(d);
-  d.connect(dg);
-  dg.connect(state.audio.masterInput);
-
-  amp.connect(rv);
-  rv.connect(rg);
-  rg.connect(state.audio.masterInput);
+  amp.connect(delaySend);
+  delaySend.connect(state.audio.padDelay);
+  amp.connect(reverbSend);
+  reverbSend.connect(state.audio.padConvolver);
 }
 
 function playBuffer(buffer, settings, startAt){
@@ -1498,44 +1569,51 @@ function getCycleAt(t){
   return Math.floor((t - state.loopStartTime) / state.loopLength);
 }
 
-function eventCrossed(evTime, prev, pos){
-  if(state.loopLength <= 0) return false;
-  if(prev < 0){
-    return evTime >= 0 && evTime <= pos;
-  }
-  if(pos >= prev){
-    return evTime > prev && evTime <= pos;
-  }
-  return evTime > prev || evTime <= pos;
-}
-
-function playbackTick(){
-  if(!state.isPlaying || state.loopLength <= 0){
-    state.playbackRaf = null;
-    return;
-  }
-
+function scheduleOneCycle(cycleStart){
+  if(!state.isPlaying || state.loopLength <= 0) return;
   const t = now();
-  const pos = currentLoopPosition(t);
-  const prev = state.lastLoopPos;
-  const cycle = getCycleAt(t);
-
+  const cycle = getCycleAt(Math.max(t, cycleStart));
   const events = state.loopEvents.slice().sort(function(a,b){ return a.time - b.time; });
+
   for(let i=0;i<events.length;i++){
     const ev = events[i];
-    if(!eventCrossed(ev.time, prev, pos)) continue;
     if(typeof ev.createdCycle === 'number' && ev.createdCycle >= cycle) continue;
-    tapPad(ev.pad, undefined, true, ev.sound, ev.settings);
+
+    const playAt = cycleStart + ev.time;
+    if(playAt < t - 0.02) continue;
+
+    const delayMs = Math.max(0, (playAt - t) * 1000);
+    setTimeout(function(){
+      if(state.isPlaying){
+        tapPad(ev.pad, undefined, true, ev.sound, ev.settings);
+      }
+    }, delayMs);
+  }
+}
+
+function scheduleNextCycles(){
+  if(!state.isPlaying || state.loopLength <= 0) return;
+
+  const t = now();
+  while(state.nextCycleStart < t - 0.03){
+    state.nextCycleStart += state.loopLength;
+    state.nextCycleNumber += 1;
   }
 
-  state.lastLoopPos = pos;
-  state.playbackRaf = requestAnimationFrame(playbackTick);
+  scheduleOneCycle(state.nextCycleStart);
+
+  state.nextCycleStart += state.loopLength;
+  state.nextCycleNumber += 1;
+
+  const waitMs = Math.max(40, (state.nextCycleStart - now() - 0.12) * 1000);
+  state.schedulerTimer = setTimeout(scheduleNextCycles, waitMs);
 }
 
 function startPlaybackEngine(triggerZero){
   stopPlaybackEngine();
-  state.lastLoopPos = triggerZero ? -0.001 : currentLoopPosition(now());
-  state.playbackRaf = requestAnimationFrame(playbackTick);
+  state.nextCycleStart = triggerZero ? state.loopStartTime : state.loopStartTime + state.loopLength;
+  state.nextCycleNumber = triggerZero ? 0 : 1;
+  scheduleNextCycles();
 }
 
 function stopPlaybackEngine(){
@@ -1544,6 +1622,7 @@ function stopPlaybackEngine(){
     state.playbackRaf = null;
   }
   clearInterval(state.schedulerTimer);
+  clearTimeout(state.schedulerTimer);
   state.schedulerTimer = null;
 }
 
@@ -2339,10 +2418,23 @@ function bindEvents(){
   $('exportMp3Btn').addEventListener('click', function(){ exportOffline(true); });
   $('exportWavBtn').addEventListener('click', function(){ exportOffline(false); });
 
+  $('bankPrevBtn').addEventListener('click', function(){
+    state.currentBank = (state.currentBank - 1 + state.banks.length) % state.banks.length;
+    renderBanks();
+    renderPads();
+    setStatus('Bank changed to ' + state.banks[state.currentBank].name + '.');
+  });
+  $('bankNextBtn').addEventListener('click', function(){
+    state.currentBank = (state.currentBank + 1) % state.banks.length;
+    renderBanks();
+    renderPads();
+    setStatus('Bank changed to ' + state.banks[state.currentBank].name + '.');
+  });
   $('bankCollapseBtn').addEventListener('click', function(){
     state.bankCollapsed = !state.bankCollapsed;
     $('deckLook').style.maxHeight = state.bankCollapsed ? '118px' : '';
-    $('deckLook').style.overflow = state.bankCollapsed ? 'hidden' : 'auto';
+    $('deckLook').style.overflowY = state.bankCollapsed ? 'hidden' : 'auto';
+    $('deckLook').style.webkitOverflowScrolling = 'touch';
     setStatus(state.bankCollapsed ? 'Banks collapsed into the deck.' : 'Banks expanded.');
   });
 
